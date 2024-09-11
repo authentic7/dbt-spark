@@ -294,7 +294,7 @@
 
 {% macro spark__list_relations_without_caching(relation) %}
   {% call statement('list_relations_without_caching', fetch_result=True) -%}
-    show table extended in {{ relation.schema }} like '*'
+    show table in {{ relation.schema }} like '*'
   {% endcall %}
 
   {% do return(load_result('list_relations_without_caching').table) %}
