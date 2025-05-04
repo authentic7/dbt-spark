@@ -3,26 +3,25 @@ import re
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import (
+    TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
+    FrozenSet,
     Iterable,
     List,
     Optional,
-    Union,
-    Type,
-    Tuple,
-    Callable,
     Set,
-    FrozenSet,
-    TYPE_CHECKING,
+    Tuple,
+    Type,
+    Union,
 )
 
 from dbt.adapters.base.relation import InformationSchema
 from dbt.adapters.contracts.connection import AdapterResponse
 from dbt.adapters.events.logging import AdapterLogger
-from dbt_common.exceptions import DbtRuntimeError, CompilationError
+from dbt_common.exceptions import CompilationError, DbtRuntimeError
 from dbt_common.utils import AttrDict, executor
-
 from typing_extensions import TypeAlias
 
 if TYPE_CHECKING:
@@ -30,20 +29,18 @@ if TYPE_CHECKING:
     # Used by mypy for earlier type hints.
     import agate
 
-from dbt.adapters.base import AdapterConfig, PythonJobHelper
-from dbt.adapters.base.impl import catch_as_completed, ConstraintSupport
+from dbt.adapters.base import AdapterConfig, BaseRelation, PythonJobHelper
+from dbt.adapters.base.impl import ConstraintSupport, catch_as_completed
+from dbt.adapters.contracts.relation import RelationConfig, RelationType
 from dbt.adapters.sql import SQLAdapter
-from dbt.adapters.spark import SparkConnectionManager
-from dbt.adapters.spark import SparkRelation
-from dbt.adapters.spark import SparkColumn
-from dbt.adapters.spark.python_submissions import (
-    JobClusterPythonJobHelper,
-    AllPurposeClusterPythonJobHelper,
-)
-from dbt.adapters.base import BaseRelation
-from dbt.adapters.contracts.relation import RelationType, RelationConfig
 from dbt_common.clients.agate_helper import DEFAULT_TYPE_TESTER
 from dbt_common.contracts.constraints import ConstraintType
+
+from dbt.adapters.spark import SparkColumn, SparkConnectionManager, SparkRelation
+from dbt.adapters.spark.python_submissions import (
+    AllPurposeClusterPythonJobHelper,
+    JobClusterPythonJobHelper,
+)
 
 logger = AdapterLogger("Spark")
 packages = ["pyhive.hive", "thrift.transport", "thrift.protocol"]
@@ -100,7 +97,9 @@ class SparkAdapter(SQLAdapter):
         "stats:rows:description",
         "stats:rows:include",
     )
-    INFORMATION_COLUMNS_REGEX = re.compile(r"^ \|-- (.*): (.*) \(nullable = (.*)\b", re.MULTILINE)
+    INFORMATION_COLUMNS_REGEX = re.compile(
+        r"^ \|-- (.*): (.*) \(nullable = (.*)\b", re.MULTILINE
+    )
     INFORMATION_OWNER_REGEX = re.compile(r"^Owner: (.*)$", re.MULTILINE)
     INFORMATION_STATISTICS_REGEX = re.compile(r"^Statistics: (.*)$", re.MULTILINE)
 
@@ -160,7 +159,9 @@ class SparkAdapter(SQLAdapter):
     def quote(self, identifier: str) -> str:
         return "`{}`".format(identifier)
 
-    def _get_relation_information(self, row: "agate.Row") -> RelationInfo:
+    def _get_relation_information(
+        self, relation: BaseRelation, row: "agate.Row"
+    ) -> RelationInfo:
         """relation info was fetched with SHOW TABLES EXTENDED"""
         try:
             _schema, name, _, information = row
@@ -169,9 +170,13 @@ class SparkAdapter(SQLAdapter):
                 f'Invalid value from "show tables extended ...", got {len(row)} values, expected 4'
             )
 
+        if hasattr(relation, "schema"):
+            _schema = relation.schema
         return _schema, name, information
 
-    def _get_relation_information_using_describe(self, row: "agate.Row") -> RelationInfo:
+    def _get_relation_information_using_describe(
+        self, relation: BaseRelation, row: "agate.Row"
+    ) -> RelationInfo:
         """Relation info fetched using SHOW TABLES and an auxiliary DESCRIBE statement"""
         try:
             _schema, name, _ = row
@@ -181,12 +186,16 @@ class SparkAdapter(SQLAdapter):
             )
 
         table_name = f"{_schema}.{name}"
+        if hasattr(relation, "schema"):
+            table_name = f"{relation.schema}.{name}"
         try:
             table_results = self.execute_macro(
                 DESCRIBE_TABLE_EXTENDED_MACRO_NAME, kwargs={"table_name": table_name}
             )
         except DbtRuntimeError as e:
-            logger.debug(f"Error while retrieving information about {table_name}: {e.msg}")
+            logger.debug(
+                f"Error while retrieving information about {table_name}: {e.msg}"
+            )
             table_results = AttrDict()
 
         information = ""
@@ -199,13 +208,14 @@ class SparkAdapter(SQLAdapter):
 
     def _build_spark_relation_list(
         self,
+        base_relation: BaseRelation,
         row_list: "agate.Table",
-        relation_info_func: Callable[["agate.Row"], RelationInfo],
+        relation_info_func: Callable[["BaseRelation", "agate.Row"], RelationInfo],
     ) -> List[BaseRelation]:
         """Aggregate relations with format metadata included."""
         relations = []
         for row in row_list:
-            _schema, name, information = relation_info_func(row)
+            _schema, name, information = relation_info_func(base_relation, row)
 
             rel_type: RelationType = (
                 RelationType.View if "Type: VIEW" in information else RelationType.Table
@@ -227,7 +237,9 @@ class SparkAdapter(SQLAdapter):
 
         return relations
 
-    def list_relations_without_caching(self, schema_relation: BaseRelation) -> List[BaseRelation]:
+    def list_relations_without_caching(
+        self, schema_relation: BaseRelation
+    ) -> List[BaseRelation]:
         """Distinct Spark compute engines may not support the same SQL featureset. Thus, we must
         try different methods to fetch relation information."""
 
@@ -235,8 +247,11 @@ class SparkAdapter(SQLAdapter):
 
         try:
             # Default compute engine behavior: show tables extended
-            show_table_extended_rows = self.execute_macro(LIST_RELATIONS_MACRO_NAME, kwargs=kwargs)
+            show_table_extended_rows = self.execute_macro(
+                LIST_RELATIONS_MACRO_NAME, kwargs=kwargs
+            )
             return self._build_spark_relation_list(
+                schema_relation,
                 row_list=show_table_extended_rows,
                 relation_info_func=self._get_relation_information,
             )
@@ -254,6 +269,7 @@ class SparkAdapter(SQLAdapter):
                         LIST_RELATIONS_SHOW_TABLES_MACRO_NAME, kwargs=kwargs
                     )
                     return self._build_spark_relation_list(
+                        schema_relation,
                         row_list=show_table_rows,
                         relation_info_func=self._get_relation_information_using_describe,
                     )
@@ -267,7 +283,9 @@ class SparkAdapter(SQLAdapter):
                 )
                 return []
 
-    def get_relation(self, database: str, schema: str, identifier: str) -> Optional[BaseRelation]:
+    def get_relation(
+        self, database: str, schema: str, identifier: str
+    ) -> Optional[BaseRelation]:
         if not self.Relation.get_default_include_policy().database:
             database = None  # type: ignore
 
@@ -333,7 +351,9 @@ class SparkAdapter(SQLAdapter):
         columns = [x for x in columns if x.name not in self.HUDI_METADATA_COLUMNS]
         return columns
 
-    def parse_columns_from_information(self, relation: BaseRelation) -> List[SparkColumn]:
+    def parse_columns_from_information(
+        self, relation: BaseRelation
+    ) -> List[SparkColumn]:
         if hasattr(relation, "information"):
             information = relation.information or ""
         else:
@@ -361,7 +381,9 @@ class SparkAdapter(SQLAdapter):
             columns.append(column)
         return columns
 
-    def _get_columns_for_catalog(self, relation: BaseRelation) -> Iterable[Dict[str, Any]]:
+    def _get_columns_for_catalog(
+        self, relation: BaseRelation
+    ) -> Iterable[Dict[str, Any]]:
         columns = self.parse_columns_from_information(relation)
 
         for column in columns:
@@ -380,7 +402,8 @@ class SparkAdapter(SQLAdapter):
         schema_map = self._get_catalog_schemas(relation_configs)
         if len(schema_map) > 1:
             raise CompilationError(
-                f"Expected only one database in get_catalog, found " f"{list(schema_map)}"
+                f"Expected only one database in get_catalog, found "
+                f"{list(schema_map)}"
             )
 
         with executor(self.config) as tpe:
@@ -408,7 +431,8 @@ class SparkAdapter(SQLAdapter):
     ) -> "agate.Table":
         if len(schemas) != 1:
             raise CompilationError(
-                f"Expected only one schema in spark _get_one_catalog, found " f"{schemas}"
+                f"Expected only one schema in spark _get_one_catalog, found "
+                f"{schemas}"
             )
 
         database = information_schema.database
@@ -424,7 +448,9 @@ class SparkAdapter(SQLAdapter):
         return agate.Table.from_object(columns, column_types=DEFAULT_TYPE_TESTER)
 
     def check_schema_exists(self, database: str, schema: str) -> bool:
-        results = self.execute_macro(LIST_SCHEMAS_MACRO_NAME, kwargs={"database": database})
+        results = self.execute_macro(
+            LIST_SCHEMAS_MACRO_NAME, kwargs={"database": database}
+        )
 
         exists = True if schema in [row[0] for row in results] else False
         return exists
@@ -481,7 +507,9 @@ class SparkAdapter(SQLAdapter):
         finally:
             conn.transaction_open = False
 
-    def generate_python_submission_response(self, submission_result: Any) -> AdapterResponse:
+    def generate_python_submission_response(
+        self, submission_result: Any
+    ) -> AdapterResponse:
         return self.connections.get_response(None)
 
     @property
