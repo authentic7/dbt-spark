@@ -225,7 +225,7 @@ class SparkAdapter(SQLAdapter):
             is_iceberg: bool = "Provider: iceberg" in information
 
             relation: BaseRelation = self.Relation.create(
-                schema=_schema,
+                schema=base_relation.schema,
                 identifier=name,
                 type=rel_type,
                 information=information,
