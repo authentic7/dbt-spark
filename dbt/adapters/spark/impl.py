@@ -206,6 +206,21 @@ class SparkAdapter(SQLAdapter):
 
         return _schema, name, information
 
+    def _get_relation_information_simple(
+        self, relation: BaseRelation, row: "agate.Row"
+    ) -> RelationInfo:
+        """Return minimal relation info without DESCRIBE EXTENDED - avoids N+1 queries"""
+        try:
+            _schema, name, _ = row
+        except ValueError:
+            raise DbtRuntimeError(
+                f'Invalid value from "show tables ...", got {len(row)} values, expected 3'
+            )
+        if hasattr(relation, "schema"):
+            _schema = relation.schema
+        # Skip DESCRIBE EXTENDED, assume Iceberg table
+        return _schema, name, "Provider: iceberg"
+
     def _build_spark_relation_list(
         self,
         base_relation: BaseRelation,
@@ -240,48 +255,27 @@ class SparkAdapter(SQLAdapter):
     def list_relations_without_caching(
         self, schema_relation: BaseRelation
     ) -> List[BaseRelation]:
-        """Distinct Spark compute engines may not support the same SQL featureset. Thus, we must
+        """Distinct Spark compute engines may not support the same SQL featureset. Thus, we mus
+t
         try different methods to fetch relation information."""
 
+        # Original behavior (SHOW TABLE EXTENDED) disabled for Iceberg v2 compatibility
+        # See: https://issues.apache.org/jira/browse/SPARK-33393
         kwargs = {"schema_relation": schema_relation}
-
         try:
-            # Default compute engine behavior: show tables extended
-            show_table_extended_rows = self.execute_macro(
-                LIST_RELATIONS_MACRO_NAME, kwargs=kwargs
-            )
+            show_table_rows = self.execute_macro(
+            LIST_RELATIONS_SHOW_TABLES_MACRO_NAME, kwargs=kwargs
+        )
             return self._build_spark_relation_list(
                 schema_relation,
-                row_list=show_table_extended_rows,
-                relation_info_func=self._get_relation_information,
+                row_list=show_table_rows,
+                relation_info_func=self._get_relation_information_simple,
+                #relation_info_func=self._get_relation_information_using_describe,
             )
         except DbtRuntimeError as e:
-            errmsg = getattr(e, "msg", "")
-            if f"Database '{schema_relation}' not found" in errmsg:
-                return []
-            # Iceberg compute engine behavior: show table
-            elif "SHOW TABLE EXTENDED is not supported for v2 tables" in errmsg:
-                # this happens with spark-iceberg with v2 iceberg tables
-                # https://issues.apache.org/jira/browse/SPARK-33393
-                try:
-                    # Iceberg behavior: 3-row result of relations obtained
-                    show_table_rows = self.execute_macro(
-                        LIST_RELATIONS_SHOW_TABLES_MACRO_NAME, kwargs=kwargs
-                    )
-                    return self._build_spark_relation_list(
-                        schema_relation,
-                        row_list=show_table_rows,
-                        relation_info_func=self._get_relation_information_using_describe,
-                    )
-                except DbtRuntimeError as e:
-                    description = "Error while retrieving information about"
-                    logger.debug(f"{description} {schema_relation}: {e.msg}")
-                    return []
-            else:
-                logger.debug(
-                    f"Error while retrieving information about {schema_relation}: {errmsg}"
-                )
-                return []
+            logger.debug(f"Error while retrieving information about {schema_relation}: {e.msg}"
+)
+            return []
 
     def get_relation(
         self, database: str, schema: str, identifier: str
